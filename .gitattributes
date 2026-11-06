@@ -1,0 +1,4 @@
+# Keep Unix line endings: these files run and are read on the Pi.
+*.sh   text eol=lf
+*.cfg  text eol=lf
+*.conf text eol=lf
