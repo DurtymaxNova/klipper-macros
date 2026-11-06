@@ -12,6 +12,7 @@ INCLUDE_LINE="[include my_macros/*.cfg]"
 ORIGIN="$(git -C "$REPO_DIR" remote get-url origin)"
 BRANCH="$(git -C "$REPO_DIR" rev-parse --abbrev-ref HEAD)"
 changed=0
+moon_changed=0
 
 [ -f "$PRINTER_CFG" ] || { echo "No printer.cfg at $CONFIG_DIR"; exit 1; }
 
@@ -35,27 +36,80 @@ for name in $(cd "$REPO_DIR" && ls *.cfg 2>/dev/null) $RETIRED; do
   fi
 done
 
-# 3. Include every .cfg in the repo
+# 3. Include every .cfg in the repo, plus this printer's settings file
+SETTINGS_NAME="my_macros_settings.cfg"
+SETTINGS_CFG="$CONFIG_DIR/$SETTINGS_NAME"
+SETTINGS_INCLUDE="[include $SETTINGS_NAME]"
+
 if ! grep -qF "$INCLUDE_LINE" "$PRINTER_CFG"; then
   sed -i "1i $INCLUDE_LINE" "$PRINTER_CFG"
   echo "Added $INCLUDE_LINE to printer.cfg"
   changed=1
 fi
 
-# 3b. Settings tables: copy each vars/*.cfg into printer.cfg once,
-#     right below the include line, if its section isn't there yet.
-#     After that the table belongs to the printer; updates never touch it.
+if [ ! -f "$SETTINGS_CFG" ]; then
+  cat > "$SETTINGS_CFG" <<'SETEOF'
+#######################################################################################################
+#   klipper-macros settings for this printer.                                                         #
+#   Edit freely: this file is yours. klipper-macros updates only ever add                             #
+#   tables for new macros here, they never change or remove what's already in it.                     #
+#######################################################################################################
+SETEOF
+  echo "Created $SETTINGS_NAME"
+  changed=1
+fi
+
+if ! grep -qF "$SETTINGS_INCLUDE" "$PRINTER_CFG"; then
+  # Right below the macros include, so the two sit together at the top.
+  awk -v inc="$INCLUDE_LINE" -v add="$SETTINGS_INCLUDE" '
+    { print } $0 == inc && !done { print add; done = 1 }
+  ' "$PRINTER_CFG" > "$PRINTER_CFG.tmp" && mv "$PRINTER_CFG.tmp" "$PRINTER_CFG"
+  echo "Added $SETTINGS_INCLUDE to printer.cfg"
+  changed=1
+fi
+
+# 3b. Settings tables (vars/*.cfg) live in the settings file.
+#     - Already in the settings file: left alone, so your values stick.
+#     - Inline in printer.cfg (older installs put them there): moved over
+#       as-is, values and comments included.
+#     - Missing: the repo's default table is added.
 for vf in "$REPO_DIR"/vars/*.cfg; do
   [ -f "$vf" ] || continue
   section="$(grep -m1 '^\[gcode_macro' "$vf")"
-  if [ -n "$section" ] && ! grep -qF "$section" "$PRINTER_CFG"; then
-    awk -v inc="$INCLUDE_LINE" -v f="$vf" '
-      { print }
-      $0 == inc && !done { print ""; while ((getline l < f) > 0) print l; print ""; done = 1 }
-    ' "$PRINTER_CFG" > "$PRINTER_CFG.tmp" && mv "$PRINTER_CFG.tmp" "$PRINTER_CFG"
-    echo "Added $section settings table to printer.cfg"
-    changed=1
+  [ -n "$section" ] || continue
+  grep -qF "$section" "$SETTINGS_CFG" && continue
+
+  if grep -qxF "$section" "$PRINTER_CFG"; then
+    python3 - "$PRINTER_CFG" "$SETTINGS_CFG" "$section" <<'PYEOF'
+import sys
+cfg, dest, section = sys.argv[1:4]
+lines = open(cfg).read().split("\n")
+i = lines.index(section)
+start = i
+# Take the comment banner sitting directly above the section with it.
+while start > 0 and lines[start - 1].startswith("#") and not lines[start - 1].startswith("#*#"):
+    start -= 1
+# The section runs until the next [section] header or the SAVE_CONFIG block.
+end = i + 1
+while end < len(lines) and not lines[end].startswith("[") and not lines[end].startswith("#*#"):
+    end += 1
+block = lines[start:end]
+while block and not block[-1].strip():
+    block.pop()
+rest = lines[:start] + lines[end:]
+# Don't leave a double blank line where the block was.
+if start < len(rest) and start > 0 and not rest[start].strip() and not rest[start - 1].strip():
+    del rest[start]
+open(cfg, "w").write("\n".join(rest))
+with open(dest, "a") as f:
+    f.write("\n" + "\n".join(block) + "\n")
+PYEOF
+    echo "Moved $section from printer.cfg to $SETTINGS_NAME (values kept)"
+  else
+    { echo; cat "$vf"; } >> "$SETTINGS_CFG"
+    echo "Added $section settings table to $SETTINGS_NAME"
   fi
+  changed=1
 done
 
 # 4. Moonraker update entry
@@ -68,10 +122,9 @@ path: $REPO_DIR
 origin: $ORIGIN
 primary_branch: $BRANCH
 managed_services: klipper
-install_script: install.sh
 EOF
   echo "Added [update_manager klipper-macros] to moonraker.conf"
-  changed=1
+  changed=1; moon_changed=1
 fi
 
 # 4b. Plugins listed in plugins/*.conf
@@ -103,18 +156,56 @@ for pf in "$REPO_DIR"/plugins/*.conf; do
      && ! grep -qE "^path: *(~|$HOME)${dir#$HOME}/?$" "$MOONRAKER_CONF"; then
     { echo; grep -v '^#' "$pf"; } >> "$MOONRAKER_CONF"
     echo "Added $section to moonraker.conf"
-    changed=1
+    changed=1; moon_changed=1
   fi
 done
 
-# 5. Restart, only when run by hand, only if something changed, never mid-print
-if [ "$changed" = 1 ] && [ -t 1 ]; then
-  state="$(curl -s localhost:7125/printer/objects/query?print_stats | grep -o '"state": *"[a-z]*"' | grep -o '[a-z]*"$' | tr -d '"' || true)"
-  if [ "$state" = "printing" ] || [ "$state" = "paused" ]; then
-    echo "Printer is $state. Restart Klipper and Moonraker after the print."
-  else
-    sudo systemctl restart moonraker klipper
-    echo "Restarted Moonraker and Klipper."
+# 5. Re-run this script automatically after every Mainsail update.
+#    Moonraker updates with `git pull`, which fires git's post-merge hook.
+#    (Moonraker's own install_script option never runs the script.)
+HOOK="$REPO_DIR/.git/hooks/post-merge"
+if ! grep -q "klipper-macros auto-setup" "$HOOK" 2>/dev/null; then
+  mkdir -p "$(dirname "$HOOK")"
+  cat > "$HOOK" <<'HOOKEOF'
+#!/bin/sh
+# klipper-macros auto-setup: re-run install.sh after each pull.
+# Output goes to klipper-macros.log (Mainsail: Machine > Logs).
+REPO="$(cd "$(dirname "$0")/../.." && pwd)"
+LOG="$HOME/printer_data/logs/klipper-macros.log"
+mkdir -p "$(dirname "$LOG")"
+{ echo "== $(date '+%F %T') update pulled, running install.sh"; bash "$REPO/install.sh"; } >> "$LOG" 2>&1 || true
+HOOKEOF
+  chmod +x "$HOOK"
+  echo "Installed auto-setup hook: install.sh now runs after every update"
+fi
+
+# 6. Restarts
+printer_state() {
+  curl -s localhost:7125/printer/objects/query?print_stats \
+    | grep -o '"state": *"[a-z]*"' | grep -o '[a-z]*"$' | tr -d '"' || true
+}
+
+if [ -t 1 ]; then
+  # Run by hand: restart now if anything changed, but never mid-print.
+  if [ "$changed" = 1 ]; then
+    state="$(printer_state)"
+    if [ "$state" = "printing" ] || [ "$state" = "paused" ]; then
+      echo "Printer is $state. Restart Klipper and Moonraker after the print."
+    else
+      sudo systemctl restart moonraker klipper
+      echo "Restarted Moonraker and Klipper."
+    fi
   fi
+elif [ "$moon_changed" = 1 ]; then
+  # Run from the update hook: Moonraker restarts Klipper itself after the
+  # update, but must restart itself to pick up new update_manager entries.
+  # Do that in the background, after the update has finished.
+  setsid nohup sh -c '
+    sleep 30
+    s=$(curl -s localhost:7125/printer/objects/query?print_stats)
+    case "$s" in *\"printing\"*|*\"paused\"*) exit 0 ;; esac
+    curl -s -X POST localhost:7125/server/restart >/dev/null
+  ' >/dev/null 2>&1 &
+  echo "moonraker.conf changed: Moonraker will restart in 30 seconds"
 fi
 echo "klipper-macros is set up."
