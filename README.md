@@ -1,1 +1,1 @@
-   git clone github-macros:DurtymaxNova/klipper-macros.git ~/klipper-macros && ~/klipper-macros/install.sh
+'git clone https://github.com/DurtymaxNova/klipper-macros.git ~/klipper-macros && ~/klipper-macros/install.sh'
