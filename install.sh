@@ -126,6 +126,48 @@ PYEOF
   changed=1
 done
 
+# 3c. New settings: when a vars/*.cfg gains a variable_ line, add just that
+#     line to this printer's existing table. Values already there, and lines
+#     you've commented out, are never touched.
+for vf in "$REPO_DIR"/vars/*.cfg; do
+  [ -f "$vf" ] || continue
+  added="$(python3 - "$vf" "$SETTINGS_CFG" <<'PYEOF'
+import re, sys
+src, dest = sys.argv[1:3]
+var_re = re.compile(r"^\s*#?\s*variable_(\w+)\s*:")
+
+src_lines = open(src).read().split("\n")
+section = next((l for l in src_lines if l.startswith("[gcode_macro")), None)
+if section is None:
+    sys.exit(0)
+repo_vars = [(m.group(1), l) for l in src_lines
+             if (m := var_re.match(l)) and not l.lstrip().startswith("#")]
+
+lines = open(dest).read().split("\n")
+if section not in lines:
+    sys.exit(0)
+start = lines.index(section)
+end = start + 1
+while end < len(lines) and not lines[end].startswith("["):
+    end += 1
+have = {m.group(1) for l in lines[start:end] if (m := var_re.match(l))}
+missing = [(name, l) for name, l in repo_vars if name not in have]
+if not missing:
+    sys.exit(0)
+
+# Insert after the table's last variable line (before its gcode: line).
+last_var = max((i for i in range(start, end) if var_re.match(lines[i])), default=start)
+lines[last_var + 1:last_var + 1] = [l for _, l in missing]
+open(dest, "w").write("\n".join(lines))
+print(" ".join(name for name, _ in missing))
+PYEOF
+)"
+  if [ -n "$added" ]; then
+    echo "Added new settings to $SETTINGS_NAME: $added"
+    changed=1
+  fi
+done
+
 # 4. Moonraker update entry
 if [ -f "$MOONRAKER_CONF" ] && ! grep -q "^\[update_manager klipper-macros\]" "$MOONRAKER_CONF"; then
   cat >> "$MOONRAKER_CONF" <<EOF
