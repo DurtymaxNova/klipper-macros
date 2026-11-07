@@ -8,7 +8,8 @@ CONFIG_DIR="${CONFIG_DIR:-$HOME/printer_data/config}"
 LINK="$CONFIG_DIR/my_macros"
 PRINTER_CFG="$CONFIG_DIR/printer.cfg"
 MOONRAKER_CONF="$CONFIG_DIR/moonraker.conf"
-INCLUDE_LINE="[include my_macros/*.cfg]"
+INCLUDE_LINE="[include my_macros/macros/*.cfg]"
+OLD_INCLUDE_LINE="[include my_macros/*.cfg]"   # pre-"macros/" layout; migrated below
 ORIGIN="$(git -C "$REPO_DIR" remote get-url origin)"
 BRANCH="$(git -C "$REPO_DIR" rev-parse --abbrev-ref HEAD)"
 changed=0
@@ -26,7 +27,7 @@ fi
 # 2. Move aside old loose copies of files the repo now provides,
 #    plus old names the repo used to have (RETIRED).
 RETIRED="mypurge.cfg"
-for name in $(cd "$REPO_DIR" && ls *.cfg 2>/dev/null) $RETIRED; do
+for name in $(cd "$REPO_DIR/macros" && ls *.cfg 2>/dev/null) $RETIRED; do
   if [ -f "$CONFIG_DIR/$name" ] && [ ! -L "$CONFIG_DIR/$name" ]; then
     mkdir -p "$CONFIG_DIR/config_backups"
     mv "$CONFIG_DIR/$name" "$CONFIG_DIR/config_backups/$name.$(date +%Y%m%d_%H%M%S)"
@@ -40,6 +41,19 @@ done
 SETTINGS_NAME="my_macros_settings.cfg"
 SETTINGS_CFG="$CONFIG_DIR/$SETTINGS_NAME"
 SETTINGS_INCLUDE="[include $SETTINGS_NAME]"
+
+# Older installs included my_macros/*.cfg, which matches nothing since the
+# macros moved into macros/ (Klipper silently ignores an empty wildcard).
+if grep -qxF "$OLD_INCLUDE_LINE" "$PRINTER_CFG"; then
+  if grep -qxF "$INCLUDE_LINE" "$PRINTER_CFG"; then
+    grep -vxF "$OLD_INCLUDE_LINE" "$PRINTER_CFG" > "$PRINTER_CFG.tmp" && mv "$PRINTER_CFG.tmp" "$PRINTER_CFG"
+  else
+    awk -v old="$OLD_INCLUDE_LINE" -v new="$INCLUDE_LINE" '$0 == old { print new; next } { print }' \
+      "$PRINTER_CFG" > "$PRINTER_CFG.tmp" && mv "$PRINTER_CFG.tmp" "$PRINTER_CFG"
+  fi
+  echo "Updated $OLD_INCLUDE_LINE to $INCLUDE_LINE in printer.cfg"
+  changed=1
+fi
 
 if ! grep -qF "$INCLUDE_LINE" "$PRINTER_CFG"; then
   sed -i "1i $INCLUDE_LINE" "$PRINTER_CFG"
